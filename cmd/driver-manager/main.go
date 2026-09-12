@@ -71,6 +71,12 @@ const (
 	nvidiaDRAValidatorDeployLabel        = nvidiaDomainPrefix + "/" + "gpu.deploy.dra-validator"
 	nvidiaDRADCGMExporterDeployLabel     = nvidiaDomainPrefix + "/" + "gpu.deploy.dcgm-exporter-dra"
 	nvidiaDRADCGMDeployLabel             = nvidiaDomainPrefix + "/" + "gpu.deploy.dcgm-dra"
+
+	// nvidiaDriverManagerCordonAnnotation records that the cordon currently on the node was
+	// applied by driver-manager. Node.Spec.Unschedulable carries no record of who set it, so
+	// without this marker a cordon applied by an administrator is indistinguishable from one
+	// applied here and would be released when the driver rotation completes.
+	nvidiaDriverManagerCordonAnnotation = nvidiaDomainPrefix + "/" + "gpu-driver-manager.node-cordoned"
 )
 
 // Configuration holds all the configuration from environment variables
@@ -413,6 +419,8 @@ func (dm *DriverManager) uninstallDriver() error {
 	if dm.isGPUPodEvictionEnabled() || (dm.components.draDriverDeployed != "" && dm.isAutoDrainEnabled()) {
 		if err := dm.cordonNode(); err != nil {
 			return fmt.Errorf("failed to cordon node: %w", err)
+		if err := dm.cordonNode(); err != nil {
+			return err
 		}
 
 		if err := dm.nvDrainNode(); err != nil {
@@ -1105,6 +1113,80 @@ func (dm *DriverManager) isGPUPodEvictionEnabled() bool {
 		return false
 	}
 	return dm.config.enableGPUPodEviction
+}
+
+// cordonNode cordons the node and records driver-manager as the owner of the cordon so it
+// can be released once the driver rotation completes. A cordon that is already in place and
+// not owned by driver-manager belongs to someone else, typically an administrator taking the
+// node out of service, and is left exactly as it was found.
+func (dm *DriverManager) cordonNode() error {
+	owned, err := dm.ownsNodeCordon()
+	if err != nil {
+		return err
+	}
+
+	if !owned {
+		unschedulable, err := dm.kubeClient.IsNodeUnschedulable(dm.config.nodeName)
+		if err != nil {
+			return err
+		}
+		if unschedulable {
+			dm.log.Infof("Node %s is already cordoned by an external actor, leaving the cordon in place", dm.config.nodeName)
+			return nil
+		}
+		// Claim the cordon before applying it. A failure between the two leaves a claim on a
+		// node that is still schedulable, which the uncordon path resolves harmlessly, whereas
+		// cordoning first would risk a cordon that no later run recognises as its own.
+		if err := dm.setCordonOwnership(true); err != nil {
+			return err
+		}
+	}
+
+	if err := dm.kubeClient.CordonNode(dm.config.nodeName); err != nil {
+		return fmt.Errorf("failed to cordon node: %w", err)
+	}
+	return nil
+}
+
+// uncordonNode releases the cordon only when driver-manager applied it. A cordon set by
+// anyone else is left in place: the node was taken out of service deliberately and returning
+// it to service is not driver-manager's decision to make.
+func (dm *DriverManager) uncordonNode() error {
+	owned, err := dm.ownsNodeCordon()
+	if err != nil {
+		return err
+	}
+	if !owned {
+		dm.log.Infof("Node %s was not cordoned by driver-manager, skipping uncordon", dm.config.nodeName)
+		return nil
+	}
+
+	if err := dm.kubeClient.UncordonNode(dm.config.nodeName); err != nil {
+		return err
+	}
+	return dm.setCordonOwnership(false)
+}
+
+func (dm *DriverManager) ownsNodeCordon() (bool, error) {
+	value, err := dm.kubeClient.GetNodeAnnotationValue(dm.config.nodeName, nvidiaDriverManagerCordonAnnotation)
+	if err != nil {
+		return false, fmt.Errorf("failed to get node %s annotation: %w", dm.config.nodeName, err)
+	}
+	return value == "true", nil
+}
+
+func (dm *DriverManager) setCordonOwnership(owned bool) error {
+	var value *string
+	if owned {
+		trueStr := "true"
+		value = &trueStr
+	}
+
+	annotations := map[string]*string{nvidiaDriverManagerCordonAnnotation: value}
+	if err := dm.kubeClient.UpdateNodeAnnotations(dm.config.nodeName, annotations); err != nil {
+		return fmt.Errorf("failed to update cordon annotation on node %s: %w", dm.config.nodeName, err)
+	}
+	return nil
 }
 
 func (dm *DriverManager) nvDrainNode() error {
