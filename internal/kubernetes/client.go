@@ -132,6 +132,48 @@ func (c *Client) UpdateNodeLabels(nodeName string, nodeLabels map[string]string)
 	})
 }
 
+// UpdateNodeAnnotations updates the annotations on a Node given a Node name and a map of
+// annotation key-value pairs. A nil value removes the annotation.
+// This method uses a strategic merge patch to avoid conflicts with concurrent updates
+func (c *Client) UpdateNodeAnnotations(nodeName string, nodeAnnotations map[string]*string) error {
+	patch := map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"annotations": nodeAnnotations,
+		},
+	}
+
+	patchBytes, err := json.Marshal(patch)
+	if err != nil {
+		return fmt.Errorf("failed to marshal patch: %w", err)
+	}
+
+	backoff := wait.Backoff{
+		Duration: time.Second,
+		Factor:   2.0,
+		Jitter:   0.2,
+		Steps:    7,
+	}
+
+	return retry.OnError(backoff, func(err error) bool {
+		return true
+	}, func() error {
+		_, err := c.clientset.CoreV1().Nodes().Patch(c.ctx, nodeName, types.StrategicMergePatchType, patchBytes, metav1.PatchOptions{})
+		if err != nil {
+			c.log.Warnf("Failed to update annotations on node %s, retrying: %v", nodeName, err)
+		}
+		return err
+	})
+}
+
+// IsNodeUnschedulable returns whether the Node is currently marked as unschedulable
+func (c *Client) IsNodeUnschedulable(nodeName string) (bool, error) {
+	node, err := c.clientset.CoreV1().Nodes().Get(c.ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		return false, fmt.Errorf("failed to get node %s: %w", nodeName, err)
+	}
+	return node.Spec.Unschedulable, nil
+}
+
 // GetNodeAnnotationValue returns the annotation value given a node name and annotation key
 func (c *Client) GetNodeAnnotationValue(nodeName, annotation string) (string, error) {
 	node, err := c.clientset.CoreV1().Nodes().Get(c.ctx, nodeName, metav1.GetOptions{})
