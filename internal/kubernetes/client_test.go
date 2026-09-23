@@ -29,6 +29,7 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
@@ -45,6 +46,7 @@ type flakyNodeAPI struct {
 	requests      int
 	patches       int
 	unschedulable bool
+	annotations   map[string]string
 }
 
 func (f *flakyNodeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -75,17 +77,27 @@ func (f *flakyNodeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		// A strategic merge patch clears spec.unschedulable with a null rather
-		// than setting it to false, so key presence is what matters here.
-		var patch map[string]any
-		if err := json.Unmarshal(body, &patch); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		if spec, ok := patch["spec"].(map[string]any); ok {
-			if value, present := spec["unschedulable"]; present {
-				cordoned, _ := value.(bool)
-				f.unschedulable = cordoned
+		if r.Method == http.MethodPut {
+			var node corev1.Node
+			if err := json.Unmarshal(body, &node); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			f.unschedulable = node.Spec.Unschedulable
+			f.annotations = node.Annotations
+		} else {
+			// A strategic merge patch clears spec.unschedulable with a null rather
+			// than setting it to false, so key presence is what matters here.
+			var patch map[string]any
+			if err := json.Unmarshal(body, &patch); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if spec, ok := patch["spec"].(map[string]any); ok {
+				if value, present := spec["unschedulable"]; present {
+					cordoned, _ := value.(bool)
+					f.unschedulable = cordoned
+				}
 			}
 		}
 	}
@@ -93,7 +105,7 @@ func (f *flakyNodeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	node := &corev1.Node{
 		TypeMeta:   metav1.TypeMeta{Kind: "Node", APIVersion: "v1"},
-		ObjectMeta: metav1.ObjectMeta{Name: f.nodeName},
+		ObjectMeta: metav1.ObjectMeta{Name: f.nodeName, Annotations: f.annotations},
 		Spec:       corev1.NodeSpec{Unschedulable: f.unschedulable},
 	}
 	if err := json.NewEncoder(w).Encode(node); err != nil {
@@ -113,6 +125,12 @@ func (f *flakyNodeAPI) cordoned() bool {
 	return f.unschedulable
 }
 
+func (f *flakyNodeAPI) annotation(key string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.annotations[key]
+}
+
 func discardLogger() *logrus.Logger {
 	log := logrus.New()
 	log.SetOutput(io.Discard)
@@ -125,7 +143,12 @@ func newTestClient(t *testing.T, api *flakyNodeAPI) *Client {
 	server := httptest.NewServer(api)
 	t.Cleanup(server.Close)
 
-	clientset, err := kubernetes.NewForConfig(&rest.Config{Host: server.URL})
+	clientset, err := kubernetes.NewForConfig(&rest.Config{
+		Host: server.URL,
+		ContentConfig: rest.ContentConfig{
+			ContentType: runtime.ContentTypeJSON,
+		},
+	})
 	require.NoError(t, err)
 
 	return &Client{ctx: context.Background(), log: discardLogger(), clientset: clientset}
@@ -194,4 +217,43 @@ func TestUncordonNodeReturnsErrorWhenPatchFails(t *testing.T) {
 	require.Error(t, c.UncordonNode("gpu-node"))
 	require.True(t, api.cordoned())
 	require.Equal(t, 1, api.patchCount())
+}
+
+func TestAcquireNodeCordonUpdatesClaimAndStateTogether(t *testing.T) {
+	api := &flakyNodeAPI{nodeName: "gpu-node"}
+	c := newTestClient(t, api)
+
+	acquired, err := c.AcquireNodeCordon("gpu-node", "example.com/owner", "example.com/peer")
+	require.NoError(t, err)
+	require.True(t, acquired)
+	require.True(t, api.cordoned())
+	require.Equal(t, "true", api.annotation("example.com/owner"))
+}
+
+func TestAcquireNodeCordonLeavesExternalCordonUnclaimed(t *testing.T) {
+	api := &flakyNodeAPI{nodeName: "gpu-node", unschedulable: true}
+	c := newTestClient(t, api)
+
+	acquired, err := c.AcquireNodeCordon("gpu-node", "example.com/owner", "example.com/peer")
+	require.NoError(t, err)
+	require.False(t, acquired)
+	require.Empty(t, api.annotation("example.com/owner"))
+	require.Equal(t, 0, api.patchCount())
+}
+
+func TestReleaseNodeCordonPreservesPeerClaim(t *testing.T) {
+	api := &flakyNodeAPI{
+		nodeName:      "gpu-node",
+		unschedulable: true,
+		annotations: map[string]string{
+			"example.com/owner": "true",
+			"example.com/peer":  "true",
+		},
+	}
+	c := newTestClient(t, api)
+
+	require.NoError(t, c.ReleaseNodeCordon("gpu-node", "example.com/owner", "example.com/peer"))
+	require.True(t, api.cordoned())
+	require.Empty(t, api.annotation("example.com/owner"))
+	require.Equal(t, "true", api.annotation("example.com/peer"))
 }

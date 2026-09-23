@@ -76,7 +76,8 @@ const (
 	// applied by driver-manager. Node.Spec.Unschedulable carries no record of who set it, so
 	// without this marker a cordon applied by an administrator is indistinguishable from one
 	// applied here and would be released when the driver rotation completes.
-	nvidiaDriverManagerCordonAnnotation = nvidiaDomainPrefix + "/" + "gpu-driver-manager.node-cordoned"
+	nvidiaDriverManagerCordonAnnotation     = nvidiaDomainPrefix + "/" + "gpu-driver-manager.node-cordoned"
+	nvidiaUpgradeControllerCordonAnnotation = nvidiaDomainPrefix + "/" + "gpu-driver-upgrade-controller.node-cordoned"
 )
 
 // Configuration holds all the configuration from environment variables
@@ -419,8 +420,6 @@ func (dm *DriverManager) uninstallDriver() error {
 	if dm.isGPUPodEvictionEnabled() || (dm.components.draDriverDeployed != "" && dm.isAutoDrainEnabled()) {
 		if err := dm.cordonNode(); err != nil {
 			return fmt.Errorf("failed to cordon node: %w", err)
-		if err := dm.cordonNode(); err != nil {
-			return err
 		}
 
 		if err := dm.nvDrainNode(); err != nil {
@@ -1120,30 +1119,19 @@ func (dm *DriverManager) isGPUPodEvictionEnabled() bool {
 // not owned by driver-manager belongs to someone else, typically an administrator taking the
 // node out of service, and is left exactly as it was found.
 func (dm *DriverManager) cordonNode() error {
-	owned, err := dm.ownsNodeCordon()
+	var acquired bool
+	err := retryOnAnyError(dm.ctx, dm.log, retryBackoff(defaultCordonRetries),
+		fmt.Sprintf("cordon node %s", dm.config.nodeName), func() error {
+			var err error
+			acquired, err = dm.kubeClient.AcquireNodeCordon(dm.config.nodeName,
+				nvidiaDriverManagerCordonAnnotation, nvidiaUpgradeControllerCordonAnnotation)
+			return err
+		})
 	if err != nil {
 		return err
 	}
-
-	if !owned {
-		unschedulable, err := dm.kubeClient.IsNodeUnschedulable(dm.config.nodeName)
-		if err != nil {
-			return err
-		}
-		if unschedulable {
-			dm.log.Infof("Node %s is already cordoned by an external actor, leaving the cordon in place", dm.config.nodeName)
-			return nil
-		}
-		// Claim the cordon before applying it. A failure between the two leaves a claim on a
-		// node that is still schedulable, which the uncordon path resolves harmlessly, whereas
-		// cordoning first would risk a cordon that no later run recognises as its own.
-		if err := dm.setCordonOwnership(true); err != nil {
-			return err
-		}
-	}
-
-	if err := dm.kubeClient.CordonNode(dm.config.nodeName); err != nil {
-		return fmt.Errorf("failed to cordon node: %w", err)
+	if !acquired {
+		dm.log.Infof("Node %s is already cordoned by an external actor, leaving the cordon in place", dm.config.nodeName)
 	}
 	return nil
 }
@@ -1152,41 +1140,12 @@ func (dm *DriverManager) cordonNode() error {
 // anyone else is left in place: the node was taken out of service deliberately and returning
 // it to service is not driver-manager's decision to make.
 func (dm *DriverManager) uncordonNode() error {
-	owned, err := dm.ownsNodeCordon()
-	if err != nil {
-		return err
-	}
-	if !owned {
-		dm.log.Infof("Node %s was not cordoned by driver-manager, skipping uncordon", dm.config.nodeName)
-		return nil
-	}
-
-	if err := dm.kubeClient.UncordonNode(dm.config.nodeName); err != nil {
-		return err
-	}
-	return dm.setCordonOwnership(false)
-}
-
-func (dm *DriverManager) ownsNodeCordon() (bool, error) {
-	value, err := dm.kubeClient.GetNodeAnnotationValue(dm.config.nodeName, nvidiaDriverManagerCordonAnnotation)
-	if err != nil {
-		return false, fmt.Errorf("failed to get node %s annotation: %w", dm.config.nodeName, err)
-	}
-	return value == "true", nil
-}
-
-func (dm *DriverManager) setCordonOwnership(owned bool) error {
-	var value *string
-	if owned {
-		trueStr := "true"
-		value = &trueStr
-	}
-
-	annotations := map[string]*string{nvidiaDriverManagerCordonAnnotation: value}
-	if err := dm.kubeClient.UpdateNodeAnnotations(dm.config.nodeName, annotations); err != nil {
-		return fmt.Errorf("failed to update cordon annotation on node %s: %w", dm.config.nodeName, err)
-	}
-	return nil
+	return retryOnAnyError(dm.ctx, dm.log, retryBackoff(defaultCordonRetries),
+		fmt.Sprintf("uncordon node %s", dm.config.nodeName),
+		func() error {
+			return dm.kubeClient.ReleaseNodeCordon(dm.config.nodeName,
+				nvidiaDriverManagerCordonAnnotation, nvidiaUpgradeControllerCordonAnnotation)
+		})
 }
 
 func (dm *DriverManager) nvDrainNode() error {
@@ -1207,21 +1166,6 @@ func (dm *DriverManager) isDriverAutoUpgradePolicyEnabled() bool {
 	}
 	dm.log.Info("Auto upgrade policy of the GPU driver on the node is disabled")
 	return false
-}
-
-// cordonNode and uncordonNode wrap the kube client calls with this command's
-// retry policy. The policy lives here rather than in the client so the client
-// stays a thin wrapper over the Kubernetes API.
-func (dm *DriverManager) cordonNode() error {
-	return retryOnAnyError(dm.ctx, dm.log, retryBackoff(defaultCordonRetries),
-		fmt.Sprintf("cordon node %s", dm.config.nodeName),
-		func() error { return dm.kubeClient.CordonNode(dm.config.nodeName) })
-}
-
-func (dm *DriverManager) uncordonNode() error {
-	return retryOnAnyError(dm.ctx, dm.log, retryBackoff(defaultCordonRetries),
-		fmt.Sprintf("uncordon node %s", dm.config.nodeName),
-		func() error { return dm.kubeClient.UncordonNode(dm.config.nodeName) })
 }
 
 func (dm *DriverManager) cleanupOnFailure() {

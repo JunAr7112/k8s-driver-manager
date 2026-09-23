@@ -186,6 +186,66 @@ func (c *Client) GetNodeAnnotationValue(nodeName, annotation string) (string, er
 	return node.Annotations[annotation], nil
 }
 
+// AcquireNodeCordon atomically records this component's cordon claim and marks
+// the Node unschedulable. If the Node is already cordoned without either GPU
+// component's claim, it is treated as externally owned and left unchanged.
+func (c *Client) AcquireNodeCordon(nodeName, claimAnnotation, peerClaimAnnotation string) (bool, error) {
+	acquired := false
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		node, err := c.clientset.CoreV1().Nodes().Get(c.ctx, nodeName, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to get node %s: %w", nodeName, err)
+		}
+
+		ownsCordon := node.Annotations[claimAnnotation] == "true"
+		peerOwnsCordon := node.Annotations[peerClaimAnnotation] == "true"
+		if node.Spec.Unschedulable && !ownsCordon && !peerOwnsCordon {
+			acquired = false
+			return nil
+		}
+
+		if node.Annotations == nil {
+			node.Annotations = make(map[string]string)
+		}
+		node.Annotations[claimAnnotation] = "true"
+		node.Spec.Unschedulable = true
+		if _, err := c.clientset.CoreV1().Nodes().Update(c.ctx, node, metav1.UpdateOptions{}); err != nil {
+			return err
+		}
+		acquired = true
+		return nil
+	})
+	if err != nil {
+		return false, fmt.Errorf("failed to acquire cordon claim on node %s: %w", nodeName, err)
+	}
+	return acquired, nil
+}
+
+// ReleaseNodeCordon atomically removes this component's claim. The Node is
+// made schedulable only when the peer GPU component has no remaining claim.
+func (c *Client) ReleaseNodeCordon(nodeName, claimAnnotation, peerClaimAnnotation string) error {
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		node, err := c.clientset.CoreV1().Nodes().Get(c.ctx, nodeName, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to get node %s: %w", nodeName, err)
+		}
+		if node.Annotations[claimAnnotation] != "true" {
+			return nil
+		}
+
+		delete(node.Annotations, claimAnnotation)
+		node.Spec.Unschedulable = node.Annotations[peerClaimAnnotation] == "true"
+		if _, err := c.clientset.CoreV1().Nodes().Update(c.ctx, node, metav1.UpdateOptions{}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("failed to release cordon claim on node %s: %w", nodeName, err)
+	}
+	return nil
+}
+
 // CordonNode cordons a Node given a Node name marking it as Unschedulable
 func (c *Client) CordonNode(nodeName string) error {
 	c.log.Infof("Cordoning node %s", nodeName)
